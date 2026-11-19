@@ -42,12 +42,14 @@ declare global {
  * - 重建模式（非保活且未做生命周期改造）：sandbox 不会被复用，且 unmount 对其而言基本是空操作
  *   （没有 mountFlag / __WUJIE_UNMOUNT），若仅 unmount 会导致 sandbox / iframe 长期驻留累积，
  *   故直接 destroy。
+ * - 子应用 location.href 跳转（hrefFlag）：wujie-app 是被跳转后的 iframe 替换下来的，sandbox 需要保留，
+ *   供浏览器后退时恢复原应用，任何模式都只 unmount。
  */
 export function handleWujieAppDisconnect(sandbox: Wujie | null | undefined): void {
   if (!sandbox) return;
   const iframeWindow = sandbox.iframe?.contentWindow;
   const isRebuildMode = !sandbox.alive && !isFunction(iframeWindow?.__WUJIE_MOUNT);
-  if (isRebuildMode) {
+  if (isRebuildMode && !sandbox.hrefFlag) {
     sandbox.destroy().catch((e) => warn(`destroy error: ${e}`));
   } else {
     sandbox.unmount().catch((e) => warn(`unmount error: ${e}`));
@@ -67,6 +69,28 @@ export function defineWujieWebComponent() {
         const sandbox = getWujieById(this.getAttribute(WUJIE_APP_ID));
         patchElementEffect(shadowRoot, sandbox.iframe.contentWindow);
         sandbox.shadowRoot = shadowRoot;
+        // 将 document.adoptedStyleSheets 代理到 shadowRoot.adoptedStyleSheets
+        if (!sandbox.degrade) {
+          const iframeWindow = sandbox.iframe.contentWindow;
+          const descriptor: PropertyDescriptor = {
+            configurable: true,
+            enumerable: true,
+            get: () => shadowRoot.adoptedStyleSheets,
+            set: (sheets: CSSStyleSheet[]) => {
+              shadowRoot.adoptedStyleSheets = sheets;
+            },
+          };
+          try {
+            Object.defineProperty(iframeWindow.Document.prototype, "adoptedStyleSheets", descriptor);
+          } catch (e) {
+            warn("代理 Document.prototype.adoptedStyleSheets 失败", e);
+          }
+          try {
+            Object.defineProperty(iframeWindow.document, "adoptedStyleSheets", descriptor);
+          } catch (e) {
+            warn("代理 document.adoptedStyleSheets 失败", e);
+          }
+        }
       }
 
       disconnectedCallback(): void {

@@ -1,4 +1,4 @@
-import WuJie from "./sandbox";
+import WuJie, { EventListenerRecord } from "./sandbox";
 import { ScriptObject } from "./template";
 import { renderElementToContainer } from "./shadow";
 import { syncUrlToWindow } from "./sync";
@@ -407,20 +407,48 @@ export function patchDegradeInstanceofAcrossRealms(appWindow: Window, renderWind
 /**
  * 记录节点的监听事件
  */
-function recordEventListeners(iframeWindow: Window) {
+function getListenerCapture(options?: boolean | EventListenerOptions): boolean {
+  return typeof options === "boolean" ? options : !!options?.capture;
+}
+
+/**
+ * 记录节点上的事件监听，供降级保活场景恢复。
+ * 与原生一致，以 type + handler + capture 识别同一个监听；
+ * once 监听触发后原生会自动移除且不经过 removeEventListener，需同步清理记录，否则恢复时会被重新绑定。
+ */
+export function recordEventListeners(iframeWindow: Window) {
   const sandbox = iframeWindow.__WUJIE;
+  const removeRecord = (node: Node, record: EventListenerRecord) => {
+    const list = sandbox.elementEventCacheMap?.get(node);
+    if (!list) return;
+    const index = list.indexOf(record);
+    if (index !== -1) list.splice(index, 1);
+    if (!list.length) sandbox.elementEventCacheMap.delete(node);
+  };
+
   iframeWindow.Node.prototype.addEventListener = function (
     type: string,
     handler: EventListenerOrEventListenerObject,
     options?: boolean | AddEventListenerOptions
   ): void {
-    // 添加事件缓存
-    const elementListenerList = sandbox.elementEventCacheMap.get(this);
-    if (elementListenerList) {
-      if (!elementListenerList.find((listener) => listener.type === type && listener.handler === handler)) {
-        elementListenerList.push({ type, handler, options });
+    const capture = getListenerCapture(options);
+    const elementListenerList = sandbox.elementEventCacheMap.get(this) || [];
+    const exists = elementListenerList.some(
+      (listener) => listener.type === type && listener.handler === handler && listener.capture === capture
+    );
+    if (!exists) {
+      const record: EventListenerRecord = { type, handler, options, capture };
+      if (handler && typeof options === "object" && options.once) {
+        // 先于业务监听注册：业务监听被更早的 stopImmediatePropagation 拦截时（原生不会消耗 once），清理也不执行。
+        // 以 this（currentTarget）定位节点，记录在恢复时被迁移到新节点后依然有效
+        record.onceCleanup = function (this: Node) {
+          removeRecord(this, record);
+        };
+        rawAddEventListener.call(this, type, record.onceCleanup, { capture, once: true });
       }
-    } else sandbox.elementEventCacheMap.set(this, [{ type, handler, options }]);
+      elementListenerList.push(record);
+      sandbox.elementEventCacheMap.set(this, elementListenerList);
+    }
     return rawAddEventListener.call(this, type, handler, options);
   };
 
@@ -429,17 +457,23 @@ function recordEventListeners(iframeWindow: Window) {
     handler: EventListenerOrEventListenerObject,
     options?: boolean | EventListenerOptions
   ): void {
-    // 清除缓存
-    const elementListenerList = sandbox.elementEventCacheMap.get(this);
-    if (elementListenerList) {
-      const index = elementListenerList?.findIndex((ele) => ele.type === type && ele.handler === handler);
-      elementListenerList.splice(index, 1);
-    }
-    if (!elementListenerList?.length) {
-      sandbox.elementEventCacheMap.delete(this);
+    const capture = getListenerCapture(options);
+    const record = sandbox.elementEventCacheMap
+      .get(this)
+      ?.find((listener) => listener.type === type && listener.handler === handler && listener.capture === capture);
+    if (record) {
+      if (record.onceCleanup) rawRemoveEventListener.call(this, type, record.onceCleanup, { capture });
+      removeRecord(this, record);
     }
     return rawRemoveEventListener.call(this, type, handler, options);
   };
+}
+
+function rebindListener(node: Node, listener: EventListenerRecord) {
+  if (listener.onceCleanup) {
+    rawAddEventListener.call(node, listener.type, listener.onceCleanup, { capture: listener.capture, once: true });
+  }
+  node.addEventListener(listener.type, listener.handler, listener.options);
 }
 
 /**
@@ -447,19 +481,14 @@ function recordEventListeners(iframeWindow: Window) {
  */
 export function recoverEventListeners(rootElement: Element | ChildNode, iframeWindow: Window) {
   const sandbox = iframeWindow.__WUJIE;
-  const elementEventCacheMap: WeakMap<
-    Node,
-    Array<{ type: string; handler: EventListenerOrEventListenerObject; options: any }>
-  > = new WeakMap();
+  const elementEventCacheMap: WeakMap<Node, Array<EventListenerRecord>> = new WeakMap();
   const ElementIterator = document.createTreeWalker(rootElement, NodeFilter.SHOW_ELEMENT, null, false);
   let nextElement = ElementIterator.currentNode;
   while (nextElement) {
     const elementListenerList = sandbox.elementEventCacheMap.get(nextElement);
     if (elementListenerList?.length) {
       elementEventCacheMap.set(nextElement, elementListenerList);
-      elementListenerList.forEach((listener) => {
-        nextElement.addEventListener(listener.type, listener.handler, listener.options);
-      });
+      elementListenerList.forEach((listener) => rebindListener(nextElement, listener));
     }
     nextElement = ElementIterator.nextNode() as HTMLElement;
   }
@@ -475,16 +504,11 @@ export function recoverDocumentListeners(
   iframeWindow: Window
 ) {
   const sandbox = iframeWindow.__WUJIE;
-  const elementEventCacheMap: WeakMap<
-    Node,
-    Array<{ type: string; handler: EventListenerOrEventListenerObject; options: any }>
-  > = new WeakMap();
+  const elementEventCacheMap: WeakMap<Node, Array<EventListenerRecord>> = new WeakMap();
   const elementListenerList = sandbox.elementEventCacheMap.get(oldRootElement);
   if (elementListenerList?.length) {
     elementEventCacheMap.set(newRootElement, elementListenerList);
-    elementListenerList.forEach((listener) => {
-      newRootElement.addEventListener(listener.type, listener.handler, listener.options);
-    });
+    elementListenerList.forEach((listener) => rebindListener(newRootElement, listener));
   }
   sandbox.elementEventCacheMap = elementEventCacheMap;
 }
@@ -707,9 +731,60 @@ export function patchDocumentEffect(iframeWindow: Window): void {
 }
 
 /**
+ * 在 iframe 的 Node.prototype 上修正 ownerDocument / baseURI。
+ *
+ * patchElementEffect 只会给 createElement / appendChild 等经过的节点打实例补丁，
+ * cloneNode、innerHTML 等产生的节点没有实例补丁：它们属于 iframe realm，原生 ownerDocument
+ * 却指向主应用 document（降级时是渲染 iframe 的 document），导致
+ * `node instanceof node.ownerDocument.defaultView.Node` 不成立、相对路径按主应用地址补全。
+ *
+ * 只在原生 ownerDocument 是宿主文档时改写，iframe 自身文档、template 惰性文档等保持原生；
+ * 实例补丁优先级更高，已打补丁的节点不受影响；沙箱销毁后回退到原生值。
+ */
+export function patchNodeOwnerDocument(iframeWindow: Window): void {
+  const rawOwnerDocumentGetter = Object.getOwnPropertyDescriptor(iframeWindow.Node.prototype, "ownerDocument")?.get;
+  const rawBaseURIGetter = Object.getOwnPropertyDescriptor(iframeWindow.Node.prototype, "baseURI")?.get;
+  if (!rawOwnerDocumentGetter || !rawBaseURIGetter) {
+    warn("Node.prototype 上缺少 ownerDocument / baseURI 访问器，跳过修正");
+    return;
+  }
+  const isHostDocument = (doc: Document): boolean => {
+    if (doc === window.document) return true;
+    const sandbox = iframeWindow.__WUJIE;
+    return !!(sandbox?.degrade && doc && doc === sandbox.document);
+  };
+  try {
+    Object.defineProperties(iframeWindow.Node.prototype, {
+      ownerDocument: {
+        configurable: true,
+        enumerable: true,
+        get() {
+          const doc = rawOwnerDocumentGetter.call(this);
+          const sandbox = iframeWindow.__WUJIE;
+          if (!sandbox || !isHostDocument(doc)) return doc;
+          return sandbox.degrade && sandbox.document ? sandbox.document : iframeWindow.document;
+        },
+      },
+      baseURI: {
+        configurable: true,
+        enumerable: true,
+        get() {
+          const proxyLocation = iframeWindow.__WUJIE?.proxyLocation as Location | undefined;
+          if (!proxyLocation || !isHostDocument(rawOwnerDocumentGetter.call(this))) return rawBaseURIGetter.call(this);
+          return proxyLocation.protocol + "//" + proxyLocation.host + proxyLocation.pathname;
+        },
+      },
+    });
+  } catch (e) {
+    warn("修正 Node.prototype 的 ownerDocument / baseURI 失败", e);
+  }
+}
+
+/**
  * patch Node effect
  * 1、处理 getRootNode
  * 2、处理 appendChild、insertBefore，当插入的节点为 svg 时，createElement 的 patch 会被去除，需要重新 patch
+ * 3、修正未打实例补丁节点的 ownerDocument / baseURI
  * @param iframeWindow
  */
 function patchNodeEffect(iframeWindow: Window): void {
@@ -717,6 +792,7 @@ function patchNodeEffect(iframeWindow: Window): void {
   const rawAppendChild = iframeWindow.Node.prototype.appendChild;
   const rawInsertRule = iframeWindow.Node.prototype.insertBefore;
   const rawRemoveChild = iframeWindow.Node.prototype.removeChild;
+  patchNodeOwnerDocument(iframeWindow);
   iframeWindow.Node.prototype.getRootNode = function (options?: GetRootNodeOptions): Node {
     const rootNode = rawGetRootNode.call(this, options);
     if (rootNode === iframeWindow.__WUJIE.shadowRoot) return iframeWindow.document;

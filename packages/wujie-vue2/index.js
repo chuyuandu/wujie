@@ -1,5 +1,5 @@
 import Vue from "vue";
-import { bus, preloadApp, startApp as rawStartApp, destroyApp, setupApp, refreshApp } from "wujie";
+import { bus, preloadApp, startApp as rawStartApp, destroyApp, setupApp, refreshApp, clearAssetsCache } from "wujie";
 
 /**
  * 清理全局 startApp 串行队列，防止组件销毁后 window.__WUJIE_QUEUE 长期持有
@@ -13,6 +13,18 @@ function clearStartAppQueue(name, queue) {
   }
 }
 
+// 只作用于组件容器，不传给 startApp
+const CONTAINER_PROPS = ["width", "height"];
+
+function getStartOptions(props) {
+  const options = {};
+  Object.keys(props).forEach((key) => {
+    if (!CONTAINER_PROPS.includes(key)) options[key] = props[key];
+  });
+  return options;
+}
+
+// 除容器属性外，props 与 startApp 参数一一对应，新增 startApp 参数时只需在此声明
 const wujieVueOptions = {
   name: "WujieVue",
   props: {
@@ -21,11 +33,13 @@ const wujieVueOptions = {
     name: { type: String, default: "" },
     loading: { type: HTMLElement, default: undefined },
     url: { type: String, default: "" },
+    html: { type: String, default: undefined },
     sync: { type: Boolean, default: undefined },
     prefix: { type: Object, default: undefined },
     alive: { type: Boolean, default: undefined },
     props: { type: Object, default: undefined },
     attrs: { type: Object, default: undefined },
+    degradeAttrs: { type: Object, default: undefined },
     replace: { type: Function, default: undefined },
     fetch: { type: Function, default: undefined },
     fiber: { type: Boolean, default: undefined },
@@ -39,7 +53,6 @@ const wujieVueOptions = {
     activated: { type: Function, default: null },
     deactivated: { type: Function, default: null },
     loadError: { type: Function, default: null },
-    style: { type: Object, default: undefined },
     iframeAddEventListeners: { type: Array, default: null },
     iframeOnEvents: { type: Array, default: null },
   },
@@ -78,32 +91,9 @@ const wujieVueOptions = {
       // 拦截组件卸载后仍残留在 __WUJIE_QUEUE Promise 链中的 .then(startApp) 幽灵执行
       if (this.isUnmounted) return;
       try {
-        // $props 是vue 2.2版本才有的属性，所以这里直接全部写一遍
         const destroy = await rawStartApp({
-          name: this.name,
-          url: this.url,
+          ...getStartOptions(this.$props),
           el: this.$refs.wujie,
-          loading: this.loading,
-          alive: this.alive,
-          fetch: this.fetch,
-          props: this.props,
-          attrs: this.attrs,
-          replace: this.replace,
-          sync: this.sync,
-          prefix: this.prefix,
-          fiber: this.fiber,
-          degrade: this.degrade,
-          plugins: this.plugins,
-          beforeLoad: this.beforeLoad,
-          beforeMount: this.beforeMount,
-          afterMount: this.afterMount,
-          beforeUnmount: this.beforeUnmount,
-          afterUnmount: this.afterUnmount,
-          activated: this.activated,
-          deactivated: this.deactivated,
-          loadError: this.loadError,
-          iframeAddEventListeners: this.iframeAddEventListeners,
-          iframeOnEvents: this.iframeOnEvents,
         });
         // 异步创建跨越了卸载点，兜底销毁孤儿 sandbox
         if (this.isUnmounted && typeof destroy === "function") {
@@ -140,11 +130,11 @@ const wujieVueOptions = {
     clearStartAppQueue(this.name, this.startAppQueue);
   },
   render(c) {
+    // Vue 2 会自动将组件 VNode 的 style 合并到根元素，避免声明同名保留 prop。
     return c("div", {
       style: {
         width: this.width,
         height: this.height,
-        ...this.style,
       },
       ref: "wujie",
     });
@@ -158,6 +148,7 @@ WujieVue.preloadApp = preloadApp;
 WujieVue.bus = bus;
 WujieVue.destroyApp = destroyApp;
 WujieVue.refreshApp = refreshApp;
+WujieVue.clearAssetsCache = clearAssetsCache;
 WujieVue.install = function (Vue) {
   Vue.component("WujieVue", WujieVue);
 };

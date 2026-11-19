@@ -1,6 +1,6 @@
 import React from "react";
 import PropTypes from "prop-types";
-import { bus, preloadApp, startApp, destroyApp, setupApp, refreshApp } from "wujie";
+import { bus, preloadApp, startApp, destroyApp, setupApp, refreshApp, clearAssetsCache } from "wujie";
 
 /**
  * 清理全局 startApp 串行队列，防止组件销毁后 window.__WUJIE_QUEUE 长期持有
@@ -21,6 +21,7 @@ export default class WujieReact extends React.PureComponent {
   static preloadApp = preloadApp;
   static destroyApp = destroyApp;
   static refreshApp = refreshApp;
+  static clearAssetsCache = clearAssetsCache;
 
   state = {
     myRef: React.createRef(),
@@ -71,6 +72,8 @@ export default class WujieReact extends React.PureComponent {
   };
 
   componentDidMount() {
+    // React 18 StrictMode（以及复用实例的场景）会在同一实例上 卸载 → 再挂载，需要重置卸载标志
+    this.isUnmounted = false;
     if (this.props.name) {
       if (window.__WUJIE_QUEUE) {
         if (window.__WUJIE_QUEUE[this.props.name]) {
